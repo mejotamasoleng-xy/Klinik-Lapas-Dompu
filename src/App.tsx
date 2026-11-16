@@ -28,6 +28,17 @@ export default function App() {
     return getCurrentSession() !== null;
   });
 
+  const syncState = store.getSyncState();
+  const downloadLocalBackup = (legacy = false) => {
+    const backup = (legacy && store.getLegacyBackup()) || store.exportFullBackup();
+    const url = URL.createObjectURL(new Blob([backup], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'cadangan-perangkat-klinik.json';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const [activeTab, setActiveTab] = useState<TabKey>('input');
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     return localStorage.getItem('klinik_dompu_theme') === 'dark';
@@ -112,6 +123,19 @@ export default function App() {
         onSelectPatient={(wbp) => setSelectedPatientForRecord(wbp)}
         activeTabLabel={tabLabels[activeTab]}
       />
+
+      <div role="status" className="border-b border-slate-200 bg-white px-4 py-2 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+        {syncState === 'online' ? '● Database online · Data diperbarui otomatis setiap 10 detik.' :
+          syncState === 'connecting' ? 'Menghubungkan ke database online…' :
+          'Database belum tersambung atau ada data yang gagal tersimpan. Perubahan belum terkonfirmasi online; unduh cadangan sebelum memuat ulang.'}
+        {syncState === 'error' && (
+          <button onClick={() => downloadLocalBackup()} className="ml-3 font-semibold text-blue-600 underline dark:text-blue-400">
+            Unduh cadangan perangkat
+          </button>
+        )}
+        {store.getLegacyBackup() && <button onClick={() => downloadLocalBackup(true)} className="ml-3 font-semibold text-blue-600 underline dark:text-blue-400">Unduh cadangan data lama</button>}
+        {store.getLegacyBackup() && <span className="ml-3">Data lama perangkat tersimpan sebagai cadangan. Gunakan Pulihkan di Pengaturan untuk memindahkannya ke database online.</span>}
+      </div>
 
       <div className="flex-1 flex overflow-hidden">
         <Sidebar activeTab={activeTab} onTabChange={setActiveTab} counts={counts} />

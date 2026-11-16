@@ -247,7 +247,24 @@ class DataStore {
   private version = 0;
   private syncInFlight: Promise<void> | null = null;
   private lastKnownServerVersion = 0;
-  private eventSource: EventSource | null = null;
+  private pendingWrites = 0;
+  private mutationRevision = 0;
+  private writeQueue: Promise<unknown> = Promise.resolve();
+  private syncState: 'connecting' | 'online' | 'error' = 'connecting';
+  private writeFailed = false;
+
+  public getSyncState() { return this.syncState; }
+
+  public getLegacyBackup(): string | null {
+    return localStorage.getItem('klinik_dompu_before_online_v1');
+  }
+
+  private setSyncState(state: 'connecting' | 'online' | 'error') {
+    if (this.syncState !== state) {
+      this.syncState = state;
+      this.notifyListeners();
+    }
+  }
   private clientId: string;
 
   constructor() {
@@ -283,75 +300,54 @@ class DataStore {
     });
   }
 
-  private apiFetch(url: string, options: RequestInit = {}) {
-    const headers: Record<string, string> = {
-      ...(options.headers as Record<string, string> | undefined),
-      'X-Client-Id': this.clientId,
-    };
-    if (options.body && !headers['Content-Type']) {
-      headers['Content-Type'] = 'application/json';
-    }
-    return fetch(url, { ...options, headers });
+  private apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
+    this.pendingWrites += 1;
+    this.mutationRevision += 1;
+    const operation = this.writeQueue.then(async () => {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          ...(options.headers as Record<string, string> | undefined),
+          'X-Client-Id': this.clientId,
+          ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        },
+      });
+      if (!response.ok) throw new Error('Gagal menyimpan ke database online.');
+      return response;
+    });
+    this.writeQueue = operation.catch(() => {});
+    return operation.then((response) => {
+      if (!this.writeFailed) this.setSyncState('online');
+      return response;
+    }).catch((error) => {
+      this.writeFailed = true;
+      this.setSyncState('error');
+      throw error;
+    }).finally(() => { this.pendingWrites -= 1; });
   }
 
   private initRealtimeSync() {
-    // Initial pull from Cloud SQL
-    this.syncFromDatabase();
-
-    // Real-time Server-Sent Events subscription
-    const connectSse = () => {
-      if (this.eventSource) {
-        this.eventSource.close();
+    // Preserve this browser's previous data before the first cloud snapshot.
+    try {
+      if (!localStorage.getItem('klinik_dompu_online_initialized_v1')) {
+        if (Object.values(STORAGE_KEYS).slice(0, 9).some((key) => localStorage.getItem(key))) {
+          localStorage.setItem('klinik_dompu_before_online_v1', this.exportFullBackup());
+        }
+        localStorage.setItem('klinik_dompu_online_initialized_v1', 'true');
       }
-      try {
-        const es = new EventSource('/api/events');
-        this.eventSource = es;
-
-        es.onmessage = (event) => {
-          try {
-            const msg = JSON.parse(event.data);
-            if (msg.type === 'connected') {
-              if (msg.version && msg.version > this.lastKnownServerVersion) {
-                this.syncFromDatabase();
-              }
-            } else if (msg.type === 'sync') {
-              if (msg.sourceClientId !== this.clientId) {
-                this.syncFromDatabase();
-              }
-            }
-          } catch {
-            // ignore malformed heartbeat
-          }
-        };
-
-        es.onerror = () => {
-          es.close();
-          this.eventSource = null;
-          setTimeout(connectSse, 5000);
-        };
-      } catch {
-        // ignore if EventSource unavailable
-      }
-    };
-
-    connectSse();
-
-    // Refresh when tab/window regains focus or visibility
-    window.addEventListener('focus', () => {
-      this.syncFromDatabase();
-    });
+    } catch {
+      // A full browser cache must not prevent connection to the online database.
+    }
+    void this.syncFromDatabase();
+    window.addEventListener('online', () => { void this.syncFromDatabase(); });
+    window.addEventListener('focus', () => { void this.syncFromDatabase(); });
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        this.syncFromDatabase();
-      }
+      if (document.visibilityState === 'visible') void this.syncFromDatabase();
     });
-
-    // Periodic background safety poll every 20s in case proxy buffers SSE
+    // Poll the shared database so changes reach devices on different server instances.
     setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        this.syncFromDatabase();
-      }
-    }, 20000);
+      if (document.visibilityState === 'visible') void this.syncFromDatabase();
+    }, 10000);
   }
 
   private loadFromLocalStorage() {
@@ -410,14 +406,17 @@ class DataStore {
   }
 
   public async syncFromDatabase(): Promise<void> {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || this.pendingWrites > 0 || this.writeFailed) return;
     if (this.syncInFlight) return this.syncInFlight;
 
     this.syncInFlight = (async () => {
       try {
+        const revision = this.mutationRevision;
         const res = await fetch('/api/sync/state', { cache: 'no-store' });
-        if (!res.ok) return;
+        if (!res.ok) throw new Error('Database tidak tersedia');
         const snapshot = await res.json();
+        if (this.pendingWrites > 0 || this.writeFailed || revision !== this.mutationRevision) return;
+        this.setSyncState('online');
 
         if (snapshot.version) {
           this.lastKnownServerVersion = snapshot.version;
@@ -441,11 +440,11 @@ class DataStore {
           }));
         }
 
-        if (Array.isArray(snapshot.referensi) && snapshot.referensi.length > 0) {
+        if (Array.isArray(snapshot.referensi)) {
           this.referensiList = snapshot.referensi;
         }
 
-        if (Array.isArray(snapshot.penyakit) && snapshot.penyakit.length > 0) {
+        if (Array.isArray(snapshot.penyakit)) {
           this.penyakitList = snapshot.penyakit;
         }
 
@@ -461,7 +460,7 @@ class DataStore {
           this.auditLogs = snapshot.audit_logs;
         }
 
-        if (Array.isArray(snapshot.master_obat) && snapshot.master_obat.length > 0) {
+        if (Array.isArray(snapshot.master_obat)) {
           this.masterObatList = snapshot.master_obat;
         }
 
@@ -472,7 +471,7 @@ class DataStore {
         this.saveToLocalStorage();
         this.notifyListeners();
       } catch {
-        // Silently continue with cached local data if offline
+        this.setSyncState('error');
       } finally {
         this.syncInFlight = null;
       }
@@ -1360,6 +1359,7 @@ class DataStore {
   }
 
   public async exportFullBackupAsync(): Promise<string> {
+    if (this.writeFailed || this.pendingWrites > 0) return this.exportFullBackup();
     const theme =
       typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEYS.THEME) || 'light' : 'light';
     try {
@@ -1425,12 +1425,12 @@ class DataStore {
             resep_obat: this.resepObatList,
           }),
         });
-        if (!res.ok) {
-          console.error('Server restore returned error:', await res.text());
-        }
+        if (!res.ok) return false;
+        this.writeFailed = false;
+        this.setSyncState('online');
       }
 
-      this.logAudit('Pulihkan Backup', 'Memulihkan cadangan menyeluruh sistem ke Cloud SQL');
+      this.logAudit('Pulihkan Backup', 'Memulihkan cadangan menyeluruh sistem ke database online');
       return true;
     } catch (e) {
       console.error('Invalid backup file', e);
