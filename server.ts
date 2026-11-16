@@ -1068,15 +1068,26 @@ app.put('/api/resep/kunjungan/:kunjunganId', async (req, res) => {
   }
 });
 
+let initializationStage = 'database connection';
+
 async function initializeApplication() {
   await pool.query('SELECT 1');
+  initializationStage = 'administrator bootstrap';
   await ensureInitialAdmin();
+  initializationStage = 'initial data seed';
   await seedInitialDataIfEmpty();
 }
 
 initializationPromise = initializeApplication().catch((error) => {
   initializationError = error;
-  console.error('Application initialization failed. Check the database and auth environment configuration.');
+  const errorCode =
+    error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : 'unknown';
+  console.error('Application initialization failed.', {
+    stage: initializationStage,
+    code: errorCode,
+  });
 });
 
 async function startServer() {
