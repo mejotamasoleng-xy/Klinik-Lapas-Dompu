@@ -4,7 +4,6 @@
  */
 
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import * as dotenv from 'dotenv';
@@ -46,14 +45,14 @@ import {
   replaceResepForKunjungan,
   deleteResepByKunjunganId,
   restoreAllTables,
-  WbpInsert,
-  KunjunganInsert,
-  ReferensiInsert,
-  PenyakitInsert,
-  SidbHistoryInsert,
-  AuditLogInsert,
-  MasterObatInsert,
-  ResepObatInsert,
+  type WbpInsert,
+  type KunjunganInsert,
+  type ReferensiInsert,
+  type PenyakitInsert,
+  type SidbHistoryInsert,
+  type AuditLogInsert,
+  type MasterObatInsert,
+  type ResepObatInsert,
 } from './src/db/queries.ts';
 import { optionalOrRequiredAuth } from './src/middleware/auth.ts';
 import {
@@ -70,62 +69,37 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
+export const app = express();
 const port = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '50mb' }));
-
-// ============================================================================
-// REAL-TIME MULTI-DEVICE BROADCAST (SSE)
-// ============================================================================
-let syncVersion = Date.now();
-const sseClients = new Set<express.Response>();
-
-function broadcastSync(scope: string, sourceClientId?: string) {
-  syncVersion += 1;
-  const payload = JSON.stringify({
-    type: 'sync',
-    version: syncVersion,
-    scope,
-    sourceClientId: sourceClientId || null,
-    timestamp: new Date().toISOString(),
-  });
-  for (const client of sseClients) {
-    try {
-      client.write(`data: ${payload}\n\n`);
-    } catch {
-      sseClients.delete(client);
-    }
+app.use('/api', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+let initialization: Promise<void> | null = null;
+app.use('/api', async (_req, res, next) => {
+  try {
+    initialization ??= seedInitialDataIfEmpty().catch((error) => {
+      initialization = null;
+      throw error;
+    });
+    await initialization;
+    next();
+  } catch {
+    res.status(503).json({ error: 'Database online belum tersedia. Silakan coba kembali.' });
   }
-}
-
-app.get('/api/events', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders?.();
-
-  sseClients.add(res);
-  res.write(
-    `data: ${JSON.stringify({ type: 'connected', version: syncVersion, timestamp: new Date().toISOString() })}\n\n`
-  );
-
-  const keepAlive = setInterval(() => {
-    try {
-      res.write(`: ping\n\n`);
-    } catch {
-      clearInterval(keepAlive);
-      sseClients.delete(res);
-    }
-  }, 25000);
-
-  req.on('close', () => {
-    clearInterval(keepAlive);
-    sseClients.delete(res);
-  });
 });
 
+// ============================================================================
+// Snapshot version is informational; clients always read shared database state.
+// ============================================================================
+let syncVersion = Date.now();
+function broadcastSync(_scope: string, _sourceClientId?: string) {
+  syncVersion = Date.now();
+}
+
+// ============================================================================
 // ============================================================================
 // DATA MAPPERS (DB <-> API/Frontend Canonical Shapes)
 // ============================================================================
@@ -405,12 +379,11 @@ function mapResepObatToClient(r: any) {
 // ============================================================================
 async function seedInitialDataIfEmpty() {
   try {
-    await seedPenyakitIfEmpty(INITIAL_PENYAKIT.map((p, idx) => mapPenyakitFromClient(p, idx)));
-    await seedReferensiIfEmpty(INITIAL_REFERENSI.map(mapReferensiFromClient));
-    await seedMasterObatIfEmpty(INITIAL_MASTER_OBAT.map(mapMasterObatFromClient));
-
     const seededFlag = await getSetting('seeded_v1');
     if (!seededFlag) {
+      await seedPenyakitIfEmpty(INITIAL_PENYAKIT.map((p, idx) => mapPenyakitFromClient(p, idx)));
+      await seedReferensiIfEmpty(INITIAL_REFERENSI.map(mapReferensiFromClient));
+      await seedMasterObatIfEmpty(INITIAL_MASTER_OBAT.map(mapMasterObatFromClient));
       await seedWbpIfEmpty(INITIAL_WBP.map(mapWbpFromClient));
       await seedKunjunganIfEmpty(INITIAL_KUNJUNGAN.map(mapKunjunganFromClient));
       const existingSettings = await getSetting('app_settings');
@@ -425,7 +398,7 @@ async function seedInitialDataIfEmpty() {
       }
     }
   } catch (err) {
-    console.error('Initial seeding notice:', err);
+    throw err;
   }
 }
 
@@ -474,7 +447,7 @@ app.get('/api/sync/state', optionalOrRequiredAuth, async (_req, res) => {
     const snapshot = await buildFullSnapshot();
     res.json(snapshot);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -506,7 +479,7 @@ app.get('/api/backup/export', optionalOrRequiredAuth, async (_req, res) => {
       resep_obat: snapshot.resep_obat,
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -569,7 +542,7 @@ app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('full_restore', clientId);
     res.json({ success: true, version: syncVersion });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -590,7 +563,7 @@ app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) =
     broadcastSync('factory_reset', clientId);
     res.json({ success: true, version: syncVersion });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -602,7 +575,7 @@ app.get('/api/wbp', optionalOrRequiredAuth, async (_req, res) => {
     const list = await getAllWbp();
     res.json(list.map(mapWbpToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -613,7 +586,7 @@ app.post('/api/wbp', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('wbp', clientId);
     res.json(mapWbpToClient(saved, 0));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -624,7 +597,7 @@ app.put('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('wbp', clientId);
     res.json(mapWbpToClient(saved, 0));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -635,7 +608,7 @@ app.delete('/api/wbp/all', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('wbp', clientId);
     res.json({ message: 'All WBP deleted', count: result.length });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -646,7 +619,7 @@ app.delete('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('wbp', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -658,7 +631,7 @@ app.post('/api/wbp/batch', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('wbp', clientId);
     res.json(result.map(mapWbpToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -670,7 +643,7 @@ app.get('/api/kunjungan', optionalOrRequiredAuth, async (_req, res) => {
     const list = await getAllKunjungan();
     res.json(list.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -683,7 +656,7 @@ app.post('/api/kunjungan', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('kunjungan', clientId);
     res.json(mapKunjunganToClient(result));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -699,7 +672,7 @@ app.put('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('kunjungan', clientId);
     res.json(result ? mapKunjunganToClient(result) : null);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -717,7 +690,7 @@ app.post('/api/kunjungan/batch', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('kunjungan', clientId);
     res.json(result.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -728,7 +701,7 @@ app.delete('/api/kunjungan/all', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('kunjungan', clientId);
     res.json({ message: 'All visits deleted', count: result.length });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -739,7 +712,7 @@ app.patch('/api/kunjungan/:id/restore', optionalOrRequiredAuth, async (req, res)
     broadcastSync('kunjungan', clientId);
     res.json(result.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -751,7 +724,7 @@ app.delete('/api/kunjungan/:id/permanent', optionalOrRequiredAuth, async (req, r
     broadcastSync('kunjungan', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -763,7 +736,7 @@ app.delete('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('kunjungan', clientId);
     res.json(result.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -775,7 +748,7 @@ app.get('/api/penyakit', async (_req, res) => {
     const list = await getAllPenyakit();
     res.json(list.map(mapPenyakitToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -786,7 +759,7 @@ app.post('/api/penyakit', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('penyakit', clientId);
     res.json(mapPenyakitToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -800,7 +773,7 @@ app.put('/api/penyakit/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('penyakit', clientId);
     res.json(mapPenyakitToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -809,7 +782,7 @@ app.get('/api/referensi', async (_req, res) => {
     const list = await getAllReferensi();
     res.json(list.map(mapReferensiToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -820,7 +793,7 @@ app.post('/api/referensi', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('referensi', clientId);
     res.json(mapReferensiToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -831,7 +804,7 @@ app.put('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('referensi', clientId);
     res.json(mapReferensiToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -842,7 +815,7 @@ app.delete('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('referensi', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -854,7 +827,7 @@ app.get('/api/pengaturan/:key', async (req, res) => {
     const value = await getSetting(req.params.key);
     res.json(value);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -865,7 +838,7 @@ app.post('/api/pengaturan/:key', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('pengaturan', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -874,7 +847,7 @@ app.get('/api/sidb-history', optionalOrRequiredAuth, async (_req, res) => {
     const list = await getSidbHistoryList();
     res.json(list.map(mapSidbToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -885,7 +858,7 @@ app.post('/api/sidb-history', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('sidb_history', clientId);
     res.json(saved ? mapSidbToClient(saved) : null);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -894,7 +867,7 @@ app.get('/api/audit', optionalOrRequiredAuth, async (_req, res) => {
     const list = await getAuditLogs(500);
     res.json(list.map(mapAuditToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -905,7 +878,7 @@ app.post('/api/audit', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('audit', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -917,7 +890,7 @@ app.get('/api/obat', optionalOrRequiredAuth, async (_req, res) => {
     const list = await getAllMasterObat();
     res.json(list.map(mapMasterObatToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -928,7 +901,7 @@ app.post('/api/obat', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('obat', clientId);
     res.json(mapMasterObatToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -939,7 +912,7 @@ app.delete('/api/obat/:id', optionalOrRequiredAuth, async (req, res) => {
     broadcastSync('obat', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -948,7 +921,7 @@ app.get('/api/resep', optionalOrRequiredAuth, async (_req, res) => {
     const list = await getAllResepObat();
     res.json(list.map(mapResepObatToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -962,7 +935,7 @@ app.put('/api/resep/kunjungan/:kunjunganId', optionalOrRequiredAuth, async (req,
     broadcastSync('resep', clientId);
     res.json(saved.map(mapResepObatToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
@@ -971,6 +944,7 @@ async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -985,8 +959,8 @@ async function startServer() {
 
   app.listen(port, '0.0.0.0', () => {
     console.log(`Server Klinik Lapas Dompu running on http://0.0.0.0:${port}`);
-    seedInitialDataIfEmpty();
+
   });
 }
 
-startServer();
+if (!process.env.NETLIFY) startServer();

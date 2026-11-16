@@ -17,7 +17,23 @@
     <meta name="twitter:card" content="summary_large_image" />
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div role="status" style="padding:48px 24px;text-align:center;font-family:system-ui,sans-serif;color:#334155">
+        <p>Memuat aplikasi Klinik Lapas Dompu…</p>
+        <p id="startup-error" hidden>Aplikasi belum dapat dimuat. Silakan muat ulang halaman. Jika tetap gagal, hubungi pengelola situs.</p>
+      </div>
+    </div>
+    <noscript>Aplikasi ini memerlukan JavaScript. Aktifkan JavaScript di browser untuk melanjutkan.</noscript>
+    <script>
+      window.addEventListener('error', function () {
+        var message = document.getElementById('startup-error');
+        if (message) message.hidden = false;
+      }, true);
+      window.addEventListener('unhandledrejection', function () {
+        var message = document.getElementById('startup-error');
+        if (message) message.hidden = false;
+      });
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
