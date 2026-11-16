@@ -5,9 +5,13 @@
 
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
+import { fromNodeHeaders, toNodeHandler } from 'better-auth/node';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import * as dotenv from 'dotenv';
+import { auth } from './src/lib/auth-server.ts';
+import { pool } from './src/db/index.ts';
+import { requireAuthenticatedSession } from './src/middleware/auth.ts';
 import {
   getAllWbp,
   upsertWbpSingle,
@@ -55,7 +59,6 @@ import {
   MasterObatInsert,
   ResepObatInsert,
 } from './src/db/queries.ts';
-import { optionalOrRequiredAuth } from './src/middleware/auth.ts';
 import {
   INITIAL_KUNJUNGAN,
   INITIAL_MASTER_OBAT,
@@ -70,10 +73,82 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
+export const app = express();
 const port = Number(process.env.PORT) || 3000;
+let initializationPromise: Promise<void> = Promise.resolve();
+let initializationError: unknown;
+const authHandler = toNodeHandler(auth);
+
+app.all('/api/auth/*', async (req, res) => {
+  const requestPath = new URL(req.originalUrl, 'http://localhost').pathname;
+  const blockedPaths = new Set([
+    '/api/auth/sign-up/email',
+    '/api/auth/sign-in/email',
+    '/api/auth/change-password',
+    '/api/auth/update-user',
+    '/api/auth/is-username-available',
+  ]);
+
+  if (req.method === 'POST' && blockedPaths.has(requestPath)) {
+    return res.sendStatus(404);
+  }
+
+  await initializationPromise;
+  if (initializationError) {
+    return res.status(503).json({ error: 'Layanan autentikasi belum tersedia.' });
+  }
+
+  try {
+    await authHandler(req, res);
+  } catch {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Permintaan autentikasi gagal diproses.' });
+    }
+  }
+});
 
 app.use(express.json({ limit: '50mb' }));
+
+app.post('/api/account/password/change', async (req, res) => {
+  await initializationPromise;
+  if (initializationError) {
+    return res.status(503).json({ error: 'Layanan autentikasi belum tersedia.' });
+  }
+
+  const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+  const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+  if (!currentPassword || newPassword.length < 12 || newPassword.length > 72) {
+    return res.status(400).json({ error: 'Kata sandi baru harus terdiri dari 12 hingga 72 karakter.' });
+  }
+
+  const headers = fromNodeHeaders(req.headers);
+  const session = await auth.api.getSession({ headers });
+  if (!session) {
+    return res.status(401).json({ error: 'Autentikasi diperlukan.' });
+  }
+
+  try {
+    await auth.api.changePassword({
+      body: { currentPassword, newPassword, revokeOtherSessions: true },
+      headers,
+    });
+    await pool.query(
+      'UPDATE public."user" SET "mustChangePassword" = false, "updatedAt" = now() WHERE id = $1',
+      [session.user.id]
+    );
+    return res.json({ success: true });
+  } catch {
+    return res.status(400).json({ error: 'Kata sandi saat ini tidak cocok atau pembaruan gagal.' });
+  }
+});
+
+app.use('/api', async (req, res, next) => {
+  await initializationPromise;
+  if (initializationError) {
+    return res.status(503).json({ error: 'Layanan database belum tersedia.' });
+  }
+  return requireAuthenticatedSession(req, res, next);
+});
 
 // ============================================================================
 // REAL-TIME MULTI-DEVICE BROADCAST (SSE)
@@ -429,6 +504,34 @@ async function seedInitialDataIfEmpty() {
   }
 }
 
+async function ensureInitialAdmin() {
+  const email = 'klinik@klinik.local';
+  const existing = await pool.query(
+    'SELECT id FROM public."user" WHERE username = $1 OR email = $2 LIMIT 1',
+    ['klinik', email]
+  );
+  if (existing.rows[0]) return;
+
+  const initialPassword = process.env.INITIAL_ADMIN_PASSWORD;
+  if (!initialPassword) {
+    throw new Error('INITIAL_ADMIN_PASSWORD is required to create the first administrator.');
+  }
+
+  await auth.api.signUpEmail({
+    body: {
+      email,
+      name: 'Petugas Klinik',
+      password: initialPassword,
+      username: 'klinik',
+    },
+  });
+
+  await pool.query(
+    'UPDATE public."user" SET "mustChangePassword" = true WHERE username = $1',
+    ['klinik']
+  );
+}
+
 async function buildFullSnapshot() {
   const [
     wbpRows,
@@ -469,7 +572,7 @@ async function buildFullSnapshot() {
 // ============================================================================
 // FULL SNAPSHOT & BACKUP ENDPOINTS
 // ============================================================================
-app.get('/api/sync/state', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/sync/state', async (_req, res) => {
   try {
     const snapshot = await buildFullSnapshot();
     res.json(snapshot);
@@ -478,7 +581,7 @@ app.get('/api/sync/state', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.get('/api/backup/export', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/backup/export', async (_req, res) => {
   try {
     const snapshot = await buildFullSnapshot();
     res.json({
@@ -510,7 +613,7 @@ app.get('/api/backup/export', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/backup/restore', async (req, res) => {
   try {
     const data = req.body;
     const clientId = req.headers['x-client-id'] as string | undefined;
@@ -573,7 +676,7 @@ app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/system/factory-reset', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await restoreAllTables({
@@ -597,7 +700,7 @@ app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) =
 // ============================================================================
 // WBP ENDPOINTS
 // ============================================================================
-app.get('/api/wbp', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/wbp', async (_req, res) => {
   try {
     const list = await getAllWbp();
     res.json(list.map(mapWbpToClient));
@@ -606,7 +709,7 @@ app.get('/api/wbp', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/wbp', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/wbp', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertWbpSingle(mapWbpFromClient(req.body));
@@ -617,7 +720,7 @@ app.post('/api/wbp', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/wbp/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertWbpSingle(mapWbpFromClient({ ...req.body, id: req.params.id }));
@@ -628,7 +731,7 @@ app.put('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/wbp/all', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/wbp/all', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await clearAllWbpFromDb();
@@ -639,7 +742,7 @@ app.delete('/api/wbp/all', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/wbp/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteWbpById(req.params.id);
@@ -650,7 +753,7 @@ app.delete('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/wbp/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/wbp/batch', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const items = Array.isArray(req.body) ? req.body.map(mapWbpFromClient) : [];
@@ -665,7 +768,7 @@ app.post('/api/wbp/batch', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // KUNJUNGAN ENDPOINTS
 // ============================================================================
-app.get('/api/kunjungan', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/kunjungan', async (_req, res) => {
   try {
     const list = await getAllKunjungan();
     res.json(list.map(mapKunjunganToClient));
@@ -674,7 +777,7 @@ app.get('/api/kunjungan', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/kunjungan', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/kunjungan', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const payload = mapKunjunganFromClient(req.body);
@@ -687,7 +790,7 @@ app.post('/api/kunjungan', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/kunjungan/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const payload = mapKunjunganFromClient({ ...req.body, id: req.params.id });
@@ -703,7 +806,7 @@ app.put('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/kunjungan/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/kunjungan/batch', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const items = Array.isArray(req.body)
@@ -721,7 +824,7 @@ app.post('/api/kunjungan/batch', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/kunjungan/all', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/all', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await clearAllKunjunganFromDb();
@@ -732,7 +835,7 @@ app.delete('/api/kunjungan/all', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.patch('/api/kunjungan/:id/restore', optionalOrRequiredAuth, async (req, res) => {
+app.patch('/api/kunjungan/:id/restore', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await restoreKunjunganById(req.params.id);
@@ -743,7 +846,7 @@ app.patch('/api/kunjungan/:id/restore', optionalOrRequiredAuth, async (req, res)
   }
 });
 
-app.delete('/api/kunjungan/:id/permanent', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/:id/permanent', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await deleteResepByKunjunganId(req.params.id);
@@ -755,7 +858,7 @@ app.delete('/api/kunjungan/:id/permanent', optionalOrRequiredAuth, async (req, r
   }
 });
 
-app.delete('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await deleteResepByKunjunganId(req.params.id);
@@ -779,7 +882,7 @@ app.get('/api/penyakit', async (_req, res) => {
   }
 });
 
-app.post('/api/penyakit', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/penyakit', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertPenyakit(mapPenyakitFromClient(req.body, 0));
@@ -790,7 +893,7 @@ app.post('/api/penyakit', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/penyakit/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/penyakit/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertPenyakit(mapPenyakitFromClient({ ...req.body, id: req.params.id }, 0));
@@ -813,7 +916,7 @@ app.get('/api/referensi', async (_req, res) => {
   }
 });
 
-app.post('/api/referensi', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/referensi', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertReferensi(mapReferensiFromClient(req.body));
@@ -824,7 +927,7 @@ app.post('/api/referensi', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/referensi/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertReferensi(mapReferensiFromClient({ ...req.body, id: req.params.id }));
@@ -835,7 +938,7 @@ app.put('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/referensi/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteReferensiById(req.params.id);
@@ -858,7 +961,7 @@ app.get('/api/pengaturan/:key', async (req, res) => {
   }
 });
 
-app.post('/api/pengaturan/:key', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/pengaturan/:key', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await setSetting(req.params.key, req.body);
@@ -869,7 +972,7 @@ app.post('/api/pengaturan/:key', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/sidb-history', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/sidb-history', async (_req, res) => {
   try {
     const list = await getSidbHistoryList();
     res.json(list.map(mapSidbToClient));
@@ -878,7 +981,7 @@ app.get('/api/sidb-history', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/sidb-history', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/sidb-history', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await addSidbHistoryEntry(mapSidbFromClient(req.body));
@@ -889,7 +992,7 @@ app.post('/api/sidb-history', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/audit', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/audit', async (_req, res) => {
   try {
     const list = await getAuditLogs(500);
     res.json(list.map(mapAuditToClient));
@@ -898,7 +1001,7 @@ app.get('/api/audit', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/audit', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/audit', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await addAuditLog(req.body);
@@ -912,7 +1015,7 @@ app.post('/api/audit', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // MASTER OBAT & RESEP OBAT ENDPOINTS
 // ============================================================================
-app.get('/api/obat', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/obat', async (_req, res) => {
   try {
     const list = await getAllMasterObat();
     res.json(list.map(mapMasterObatToClient));
@@ -921,7 +1024,7 @@ app.get('/api/obat', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/obat', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/obat', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertMasterObat(mapMasterObatFromClient(req.body));
@@ -932,7 +1035,7 @@ app.post('/api/obat', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/obat/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/obat/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteMasterObatById(req.params.id);
@@ -943,7 +1046,7 @@ app.delete('/api/obat/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/resep', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/resep', async (_req, res) => {
   try {
     const list = await getAllResepObat();
     res.json(list.map(mapResepObatToClient));
@@ -952,7 +1055,7 @@ app.get('/api/resep', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.put('/api/resep/kunjungan/:kunjunganId', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/resep/kunjungan/:kunjunganId', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const items = Array.isArray(req.body)
@@ -966,27 +1069,36 @@ app.put('/api/resep/kunjungan/:kunjunganId', optionalOrRequiredAuth, async (req,
   }
 });
 
-// Setup Vite middlewares for Frontend SPA
-async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
+async function initializeApplication() {
+  await pool.query('SELECT 1');
+  await ensureInitialAdmin();
+  await seedInitialDataIfEmpty();
+}
 
-  if (!isProd) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
-    });
-  }
+initializationPromise = initializeApplication().catch((error) => {
+  initializationError = error;
+  console.error('Application initialization failed. Check the database and auth environment configuration.');
+});
+
+async function startServer() {
+  await initializationPromise;
+  if (initializationError) throw initializationError;
+
+  const vite = await createViteServer({
+    server: { middlewareMode: true },
+    appType: 'spa',
+  });
+  app.use(vite.middlewares);
 
   app.listen(port, '0.0.0.0', () => {
     console.log(`Server Klinik Lapas Dompu running on http://0.0.0.0:${port}`);
-    seedInitialDataIfEmpty();
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1' || process.env.PORT) {
+  void startServer().catch(() => {
+    process.exitCode = 1;
+  });
+}
+
+export default app;

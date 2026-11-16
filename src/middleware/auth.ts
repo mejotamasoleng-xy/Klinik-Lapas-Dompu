@@ -1,37 +1,29 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
+import { fromNodeHeaders } from 'better-auth/node';
+import type { NextFunction, Request, Response } from 'express';
+import { auth } from '../lib/auth-server.ts';
 
-import type { Request, Response, NextFunction } from 'express';
-import { adminAuth } from '../lib/firebase-admin.ts';
-import type { DecodedIdToken } from 'firebase-admin/auth';
-
-export interface AuthRequest extends Request {
-  user?: DecodedIdToken;
-}
-
-export const optionalOrRequiredAuth = async (
-  req: AuthRequest,
+export async function requireAuthenticatedSession(
+  req: Request,
   res: Response,
   next: NextFunction
-) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    // For single shared clinic session in clinic environment, permit access
-    return next();
-  }
-
-  const token = authHeader.split('Bearer ')[1];
-  if (!adminAuth) {
-    return next();
-  }
+) {
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    req.user = decodedToken;
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session) {
+      res.status(401).json({ error: 'Autentikasi diperlukan.' });
+      return;
+    }
+
+    if (session.user.mustChangePassword) {
+      res.status(428).json({ error: 'Kata sandi awal harus diganti sebelum menggunakan aplikasi.' });
+      return;
+    }
+
     next();
-  } catch (error) {
-    // Proceed if verifying fails in dev/proxy or proceed without crash
-    next();
+  } catch {
+    res.status(401).json({ error: 'Sesi tidak valid atau telah berakhir.' });
   }
-};
+}

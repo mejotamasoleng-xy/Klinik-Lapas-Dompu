@@ -183,7 +183,7 @@ export async function getAllWbp() {
     return await db.select().from(wbp);
   } catch (error) {
     console.error('Failed to fetch WBP:', error);
-    return memoryStore.wbp;
+    throw new Error('Failed to fetch WBP records.', { cause: error });
   }
 }
 
@@ -288,7 +288,7 @@ export async function getAllKunjungan() {
     return await db.select().from(kunjungan).orderBy(desc(kunjungan.createdAt));
   } catch (error) {
     console.error('Failed to fetch Kunjungan:', error);
-    return memoryStore.kunjungan;
+    throw new Error('Failed to fetch visit records.', { cause: error });
   }
 }
 
@@ -486,7 +486,7 @@ export async function getAllPenyakit() {
     return await db.select().from(daftarPenyakit).orderBy(daftarPenyakit.urutan);
   } catch (error) {
     console.error('Failed to fetch Penyakit:', error);
-    return memoryStore.penyakit;
+    throw new Error('Failed to fetch disease references.', { cause: error });
   }
 }
 
@@ -529,7 +529,7 @@ export async function getAllReferensi() {
     return await db.select().from(referensiIcd10);
   } catch (error) {
     console.error('Failed to fetch Referensi:', error);
-    return memoryStore.referensi;
+    throw new Error('Failed to fetch ICD-10 references.', { cause: error });
   }
 }
 
@@ -622,7 +622,7 @@ export async function getSetting(key: string) {
     return result[0]?.value ?? null;
   } catch (error) {
     console.error(`Failed to get setting ${key}:`, error);
-    return memoryStore.pengaturan.get(key) ?? null;
+    throw new Error('Failed to read application settings.', { cause: error });
   }
 }
 
@@ -679,7 +679,7 @@ export async function getAuditLogs(limitCount = 500) {
     return await db.select().from(auditLogs).orderBy(desc(auditLogs.createdAt)).limit(limitCount);
   } catch (error) {
     console.error('Failed to get audit logs:', error);
-    return memoryStore.auditLogs;
+    throw new Error('Failed to fetch audit logs.', { cause: error });
   }
 }
 
@@ -692,7 +692,7 @@ export async function getSidbHistoryList() {
     return await db.select().from(sidbHistory).orderBy(desc(sidbHistory.createdAt));
   } catch (error) {
     console.error('Failed to get SIDB history:', error);
-    return memoryStore.sidbHistory;
+    throw new Error('Failed to fetch SIDB history.', { cause: error });
   }
 }
 
@@ -750,7 +750,7 @@ export async function getAllMasterObat() {
     return await db.select().from(masterObat).orderBy(masterObat.nama);
   } catch (error) {
     console.error('Failed to fetch Master Obat:', error);
-    return memoryStore.masterObat;
+    throw new Error('Failed to fetch medicine data.', { cause: error });
   }
 }
 
@@ -819,7 +819,7 @@ export async function getAllResepObat() {
     return await db.select().from(resepObat).orderBy(desc(resepObat.createdAt));
   } catch (error) {
     console.error('Failed to fetch Resep Obat:', error);
-    return memoryStore.resepObat;
+    throw new Error('Failed to fetch prescriptions.', { cause: error });
   }
 }
 

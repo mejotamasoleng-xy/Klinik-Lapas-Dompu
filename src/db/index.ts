@@ -1,34 +1,26 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import 'dotenv/config';
-import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
+import * as dotenv from 'dotenv';
+import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 import * as schema from './schema.ts';
+
+dotenv.config({ path: '.env.development.local' });
+dotenv.config();
 
 declare global {
   var _postgresPool: Pool | undefined;
 }
 
-export const hasSqlConfig = Boolean(
-  process.env.SQL_HOST &&
-    process.env.SQL_DB_NAME &&
-    process.env.SQL_USER &&
-    process.env.SQL_PASSWORD
-);
+const connectionString = process.env.DATABASE_URL ?? process.env.POSTGRES_URL;
+if (!connectionString) {
+  throw new Error('DATABASE_URL must be configured for the online database.');
+}
+
+export const hasSqlConfig = true;
 
 export const createPool = () => {
-  if (!hasSqlConfig) {
-    return null;
-  }
-  if (!global._postgresPool) {
-    global._postgresPool = new Pool({
-      host: process.env.SQL_HOST,
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DB_NAME,
+  if (!globalThis._postgresPool) {
+    globalThis._postgresPool = new Pool({
+      connectionString,
       max: 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 15000,
@@ -36,32 +28,12 @@ export const createPool = () => {
       keepAliveInitialDelayMillis: 10000,
     });
 
-    global._postgresPool.on('error', (err) => {
-      // Cloud SQL Proxy / Postgres may close idle sockets; pool replaces them on next checkout
-      if ((err as any)?.message?.includes('Connection terminated unexpectedly')) {
-        console.warn('Idle SQL pool client recycled after server close.');
-        return;
-      }
-      console.error('Unexpected error on idle SQL pool client:', err);
+    globalThis._postgresPool.on('error', (error) => {
+      console.error('Unexpected error on the Neon PostgreSQL pool:', error);
     });
   }
-  return global._postgresPool;
+  return globalThis._postgresPool;
 };
 
-let dbInstance: NodePgDatabase<typeof schema> | null = null;
-
-if (hasSqlConfig) {
-  try {
-    const pool = createPool();
-    if (pool) {
-      dbInstance = drizzle(pool, { schema });
-    }
-  } catch (err) {
-    console.warn('[AI Studio] Database initialization failed — using in-memory mock:', err);
-    dbInstance = null;
-  }
-} else {
-  console.warn('[AI Studio] SQL environment variables not configured — using in-memory database mock');
-}
-
-export const db = dbInstance;
+export const pool = createPool();
+export const db: NodePgDatabase<typeof schema> = drizzle(pool, { schema });
