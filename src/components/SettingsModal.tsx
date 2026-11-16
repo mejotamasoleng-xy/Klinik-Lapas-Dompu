@@ -19,7 +19,8 @@ import {
   AlertCircle,
   Plus,
 } from 'lucide-react';
-import { hashPassword, store, useStoreSync } from '../lib/storage';
+import { store, useStoreSync } from '../lib/storage';
+import { setAuthToken } from '../lib/auth';
 import { BatchConfig } from '../types';
 import ReferencesManager from './ReferencesManager';
 import SidbUpdater from './SidbUpdater';
@@ -74,24 +75,25 @@ export default function SettingsModal() {
     e.preventDefault();
     setPassMsg(null);
 
-    const oldHash = await hashPassword(currentPass);
-    if (oldHash !== pengaturan.password_hash) {
-      setPassMsg({ type: 'error', text: 'Kata sandi lama tidak sesuai.' });
-      return;
-    }
-
     if (newPass.length < 5) {
       setPassMsg({ type: 'error', text: 'Kata sandi baru minimal 5 karakter.' });
       return;
     }
-
     if (newPass !== confirmPass) {
       setPassMsg({ type: 'error', text: 'Konfirmasi kata sandi tidak cocok.' });
       return;
     }
-
-    const newHash = await hashPassword(newPass);
-    store.updatePengaturan({ password_hash: newHash });
+    const res = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword: currentPass, newPassword: newPass }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setPassMsg({ type: 'error', text: body.error || 'Gagal memperbarui kata sandi.' });
+      return;
+    }
+    if (body.token) setAuthToken(body.token);
     store.logAudit('Ganti Password', 'Petugas berhasil memperbarui kata sandi akun bersama');
     setPassMsg({ type: 'success', text: 'Kata sandi berhasil diperbarui!' });
     setCurrentPass('');
