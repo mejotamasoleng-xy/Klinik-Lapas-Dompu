@@ -4,7 +4,6 @@
  */
 
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import { fromNodeHeaders, toNodeHandler } from 'better-auth/node';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -1084,7 +1083,8 @@ async function startServer() {
   await initializationPromise;
   if (initializationError) throw initializationError;
 
-  const vite = await createViteServer({
+  const { createServer } = await import('vite');
+  const vite = await createServer({
     server: { middlewareMode: true },
     appType: 'spa',
   });
@@ -1095,7 +1095,7 @@ async function startServer() {
   });
 }
 
-if (process.env.VERCEL !== '1' || process.env.PORT) {
+if (process.env.VERCEL !== '1') {
   void startServer().catch(() => {
     process.exitCode = 1;
   });
