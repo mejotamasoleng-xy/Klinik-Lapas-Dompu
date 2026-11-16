@@ -7,7 +7,9 @@ import React, { lazy, Suspense, useState, useEffect } from 'react';
 import Header from './components/Header';
 import Sidebar, { TabKey } from './components/Sidebar';
 import LoginView from './components/LoginView';
-import { getCurrentSession, logoutSession } from './lib/auth';
+import { logoutSession } from './lib/auth';
+import PasswordChangeView from './components/PasswordChangeView';
+import { authClient } from './lib/auth-client';
 import { store, useStoreSync } from './lib/storage';
 import { WbpItem } from './types';
 
@@ -24,10 +26,11 @@ const MedicalRecordModal = lazy(() => import('./components/MedicalRecordModal'))
 
 export default function App() {
   const storeVersion = useStoreSync();
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    return getCurrentSession() !== null;
-  });
-
+  const { data: session, isPending, refetch } = authClient.useSession();
+  const isAuthenticated = Boolean(session?.user);
+  const mustChangePassword = Boolean(
+    (session?.user as { mustChangePassword?: boolean } | undefined)?.mustChangePassword
+  );
   const [activeTab, setActiveTab] = useState<TabKey>('input');
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     return localStorage.getItem('klinik_dompu_theme') === 'dark';
@@ -71,20 +74,30 @@ export default function App() {
     localStorage.setItem('klinik_dompu_theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
 
+  useEffect(() => {
+    if (isAuthenticated && !mustChangePassword) {
+      void store.syncFromDatabase();
+    }
+  }, [isAuthenticated, mustChangePassword]);
+
   const handleLogout = () => {
-    logoutSession();
-    setIsAuthenticated(false);
+    void logoutSession();
   };
 
-  if (!isAuthenticated) {
+  if (isPending) {
     return (
-      <LoginView
-        onLoginSuccess={() => {
-          setIsAuthenticated(true);
-          setActiveTab('input');
-        }}
-      />
+      <main className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-500 dark:bg-slate-950 dark:text-slate-400">
+        Memeriksa sesi aman…
+      </main>
     );
+  }
+
+  if (!isAuthenticated) {
+    return <LoginView onLoginSuccess={() => setActiveTab('input')} />;
+  }
+
+  if (mustChangePassword) {
+    return <PasswordChangeView onPasswordChanged={() => void refetch()} />;
   }
 
   const freshSelectedPatient = selectedPatientForRecord
