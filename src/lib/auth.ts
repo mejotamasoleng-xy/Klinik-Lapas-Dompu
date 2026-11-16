@@ -71,50 +71,70 @@ export async function loginWithCredentials(
 
   const cleanUser = usernameInput.trim();
   const cleanPass = passwordInput.trim();
-
   if (!cleanUser || !cleanPass) {
     return { success: false, message: 'Username dan password wajib diisi.' };
   }
-
-  if (cleanUser !== 'klinik') {
-    const att = recordFailedAttempt();
-    if (att.isLocked) {
-      return {
-        success: false,
-        message: 'Salah password 5 kali berturut-turut. Akses ditahan selama 1 menit demi keamanan.',
-      };
-    }
-    return { success: false, message: 'Kombinasi username atau password tidak sesuai.' };
+  const res = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: cleanUser, password: cleanPass, rememberMe }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.token) {
+    const att = res.status === 401 ? recordFailedAttempt() : null;
+    return { success: false, message: body.error || (att?.isLocked ? 'Akses ditahan sementara.' : 'Gagal masuk.') };
   }
-
-  const currentSettings = store.getPengaturan();
-  const inputHash = await hashPassword(cleanPass);
-
-  if (inputHash !== currentSettings.password_hash) {
-    const att = recordFailedAttempt();
-    if (att.isLocked) {
-      return {
-        success: false,
-        message: 'Salah password 5 kali berturut-turut. Akses ditahan selama 1 menit demi keamanan.',
-      };
-    }
-    return { success: false, message: 'Kombinasi username atau password tidak sesuai.' };
-  }
-
-  // Success
   resetFailedAttempts();
-  const session: AuthState = {
+  const session: AuthState & { token: string } = {
     isAuthenticated: true,
     username: cleanUser,
     loginTime: now,
     rememberMe,
+    token: body.token,
   };
-
-  const storageToUse = rememberMe ? localStorage : sessionStorage;
-  storageToUse.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
-
+  (rememberMe ? localStorage : sessionStorage).setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  store.syncFromDatabase().catch(() => {});
   store.logAudit('Login Berhasil', 'Petugas berhasil masuk ke sistem klinik');
   return { success: true };
+}
+
+export function getAuthToken(): string | null {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY) || sessionStorage.getItem(SESSION_STORAGE_KEY);
+    return raw ? JSON.parse(raw).token || null : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setAuthToken(token: string) {
+  for (const s of [localStorage, sessionStorage]) {
+    const raw = s.getItem(SESSION_STORAGE_KEY);
+    if (raw) s.setItem(SESSION_STORAGE_KEY, JSON.stringify({ ...JSON.parse(raw), token, loginTime: Date.now() }));
+  }
+}
+
+// Attach the session token to every same-origin API request.
+if (typeof window !== 'undefined' && !(window as any).__klinikFetchPatched) {
+  (window as any).__klinikFetchPatched = true;
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const token = getAuthToken();
+    if (token && url.startsWith('/api/') && !url.startsWith('/api/auth/login')) {
+      const headers = new Headers(init.headers);
+      if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
+      init = { ...init, headers };
+    }
+    return originalFetch(input, init).then((r) => {
+      if (r.status === 401 && token && url.startsWith('/api/') && !url.startsWith('/api/auth/')) {
+        localStorage.removeItem(SESSION_STORAGE_KEY);
+        sessionStorage.removeItem(SESSION_STORAGE_KEY);
+        window.location.reload();
+      }
+      return r;
+    });
+  };
 }
 
 export function getCurrentSession(): AuthState | null {
@@ -125,7 +145,11 @@ export function getCurrentSession(): AuthState | null {
     }
     if (!raw) return null;
 
-    const parsed: AuthState = JSON.parse(raw);
+    const parsed: AuthState & { token?: string } = JSON.parse(raw);
+    if (!parsed.token) {
+      logoutSession();
+      return null;
+    }
     const now = Date.now();
     // 30 days expiration if rememberMe, else 24 hours
     const maxAge = parsed.rememberMe ? 30 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
@@ -140,7 +164,7 @@ export function getCurrentSession(): AuthState | null {
 }
 
 export function logoutSession() {
+  if (getAuthToken()) store.logAudit('Logout', 'Petugas keluar dari sistem klinik');
   localStorage.removeItem(SESSION_STORAGE_KEY);
   sessionStorage.removeItem(SESSION_STORAGE_KEY);
-  store.logAudit('Logout', 'Petugas keluar dari sistem klinik');
 }

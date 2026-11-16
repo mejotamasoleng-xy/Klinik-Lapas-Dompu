@@ -290,6 +290,10 @@ export async function setSetting(key: string, value: any) {
     .returning();
 }
 
+export async function setSettingIfAbsent(key: string, value: any) {
+  await db.insert(pengaturanApp).values({ key, value }).onConflictDoNothing();
+}
+
 // Audit Logs
 export async function addAuditLog(entry: AuditLogInsert) {
   return await db.insert(auditLogs).values(entry).onConflictDoNothing().returning();

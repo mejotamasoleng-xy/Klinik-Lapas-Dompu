@@ -54,7 +54,14 @@ import {
   type MasterObatInsert,
   type ResepObatInsert,
 } from './src/db/queries.ts';
-import { optionalOrRequiredAuth } from './src/middleware/auth.ts';
+import {
+  CLINIC_USERNAME,
+  changePassword,
+  issueToken,
+  requireAuth,
+  verifyPassword,
+  type AuthRequest,
+} from './src/middleware/auth.ts';
 import {
   INITIAL_KUNJUNGAN,
   INITIAL_MASTER_OBAT,
@@ -90,6 +97,89 @@ app.use('/api', async (_req, res, next) => {
     res.status(503).json({ error: 'Database online belum tersedia. Silakan coba kembali.' });
   }
 });
+
+// ============================================================================
+// AUTHENTICATION (shared clinic account, verified server-side)
+// ============================================================================
+const loginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_LOCK_MS = 60 * 1000;
+
+function clientKey(req: express.Request) {
+  return String(req.headers['x-nf-client-connection-ip'] || req.headers['x-forwarded-for'] || req.ip || 'unknown')
+    .split(',')[0]
+    .trim();
+}
+
+app.post('/api/auth/login', async (req, res) => {
+  const key = clientKey(req);
+  const now = Date.now();
+  const attempt = loginAttempts.get(key);
+  if (attempt && attempt.lockedUntil > now) {
+    const wait = Math.ceil((attempt.lockedUntil - now) / 1000);
+    return res.status(429).json({
+      error: `Terlalu banyak percobaan gagal. Silakan tunggu ${wait} detik sebelum mencoba kembali.`,
+    });
+  }
+  const username = String(req.body?.username ?? '').trim();
+  const password = String(req.body?.password ?? '').trim();
+  const rememberMe = Boolean(req.body?.rememberMe);
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username dan password wajib diisi.' });
+  }
+  try {
+    const ok = username === CLINIC_USERNAME && (await verifyPassword(password));
+    if (!ok) {
+      const count = (attempt && attempt.lockedUntil <= now && attempt.count >= MAX_LOGIN_ATTEMPTS ? 0 : attempt?.count ?? 0) + 1;
+      loginAttempts.set(key, { count, lockedUntil: count >= MAX_LOGIN_ATTEMPTS ? now + LOGIN_LOCK_MS : 0 });
+      await new Promise((r) => setTimeout(r, 400));
+      return res.status(401).json({
+        error:
+          count >= MAX_LOGIN_ATTEMPTS
+            ? 'Salah password 5 kali berturut-turut. Akses ditahan selama 1 menit demi keamanan.'
+            : 'Kombinasi username atau password tidak sesuai.',
+      });
+    }
+    loginAttempts.delete(key);
+    res.json({ token: await issueToken(username, rememberMe), username });
+  } catch {
+    res.status(503).json({ error: 'Layanan login belum tersedia. Silakan coba kembali.' });
+  }
+});
+
+// Every API route registered below requires a valid session token.
+app.use('/api', requireAuth);
+
+app.get('/api/auth/session', (req: AuthRequest, res) => {
+  res.json({ username: req.user?.username });
+});
+
+app.post('/api/auth/change-password', async (req: AuthRequest, res) => {
+  const currentPassword = String(req.body?.currentPassword ?? '').trim();
+  const newPassword = String(req.body?.newPassword ?? '').trim();
+  try {
+    if (!(await verifyPassword(currentPassword))) {
+      return res.status(400).json({ error: 'Kata sandi lama tidak sesuai.' });
+    }
+    if (newPassword.length < 5) {
+      return res.status(400).json({ error: 'Kata sandi baru minimal 5 karakter.' });
+    }
+    await changePassword(newPassword);
+    res.json({ success: true, token: await issueToken(req.user?.username || CLINIC_USERNAME, true) });
+  } catch {
+    res.status(500).json({ error: 'Gagal memperbarui kata sandi. Silakan coba kembali.' });
+  }
+});
+
+// Never send or accept credential material through the shared settings object.
+function sanitizeSettings<T>(value: T): T {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const { password_hash: _omit, ...rest } = value as Record<string, unknown>;
+    return rest as T;
+  }
+  return value;
+}
+const PRIVATE_SETTING_KEYS = /^(auth_|seeded_)/;
 
 // ============================================================================
 // Snapshot version is informational; clients always read shared database state.
@@ -431,7 +521,7 @@ async function buildFullSnapshot() {
     kunjungan: kunjunganRows.map(mapKunjunganToClient),
     referensi: referensiRows.map(mapReferensiToClient),
     penyakit: penyakitRows.map(mapPenyakitToClient),
-    pengaturan: appSettings || INITIAL_PENGATURAN,
+    pengaturan: sanitizeSettings(appSettings || INITIAL_PENGATURAN),
     sidb_history: sidbRows.map(mapSidbToClient),
     audit_logs: auditRows.map(mapAuditToClient),
     master_obat: obatRows.map(mapMasterObatToClient),
@@ -442,7 +532,7 @@ async function buildFullSnapshot() {
 // ============================================================================
 // FULL SNAPSHOT & BACKUP ENDPOINTS
 // ============================================================================
-app.get('/api/sync/state', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/sync/state', async (_req, res) => {
   try {
     const snapshot = await buildFullSnapshot();
     res.json(snapshot);
@@ -451,7 +541,7 @@ app.get('/api/sync/state', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.get('/api/backup/export', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/backup/export', async (_req, res) => {
   try {
     const snapshot = await buildFullSnapshot();
     res.json({
@@ -483,7 +573,7 @@ app.get('/api/backup/export', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/backup/restore', async (req, res) => {
   try {
     const data = req.body;
     const clientId = req.headers['x-client-id'] as string | undefined;
@@ -532,7 +622,9 @@ app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
       kunjungan: kunjunganRows,
       referensi: referensiRows,
       penyakit: penyakitRows,
-      pengaturan: data.pengaturan ? { ...INITIAL_PENGATURAN, ...data.pengaturan } : INITIAL_PENGATURAN,
+      pengaturan: sanitizeSettings(
+        data.pengaturan ? { ...INITIAL_PENGATURAN, ...data.pengaturan } : INITIAL_PENGATURAN
+      ),
       sidbHistory: sidbRows,
       auditLogs: auditRows,
       masterObat: masterObatRows,
@@ -546,7 +638,7 @@ app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/system/factory-reset', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await restoreAllTables({
@@ -554,7 +646,7 @@ app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) =
       kunjungan: INITIAL_KUNJUNGAN.map(mapKunjunganFromClient),
       referensi: INITIAL_REFERENSI.map(mapReferensiFromClient),
       penyakit: INITIAL_PENYAKIT.map((p, idx) => mapPenyakitFromClient(p, idx)),
-      pengaturan: INITIAL_PENGATURAN,
+      pengaturan: sanitizeSettings(INITIAL_PENGATURAN),
       sidbHistory: [],
       auditLogs: [],
       masterObat: INITIAL_MASTER_OBAT.map(mapMasterObatFromClient),
@@ -570,7 +662,7 @@ app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) =
 // ============================================================================
 // WBP ENDPOINTS
 // ============================================================================
-app.get('/api/wbp', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/wbp', async (_req, res) => {
   try {
     const list = await getAllWbp();
     res.json(list.map(mapWbpToClient));
@@ -579,7 +671,7 @@ app.get('/api/wbp', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/wbp', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/wbp', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertWbpSingle(mapWbpFromClient(req.body));
@@ -590,7 +682,7 @@ app.post('/api/wbp', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/wbp/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertWbpSingle(mapWbpFromClient({ ...req.body, id: req.params.id }));
@@ -601,7 +693,7 @@ app.put('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/wbp/all', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/wbp/all', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await clearAllWbpFromDb();
@@ -612,7 +704,7 @@ app.delete('/api/wbp/all', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/wbp/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteWbpById(req.params.id);
@@ -623,7 +715,7 @@ app.delete('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/wbp/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/wbp/batch', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const items = Array.isArray(req.body) ? req.body.map(mapWbpFromClient) : [];
@@ -638,7 +730,7 @@ app.post('/api/wbp/batch', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // KUNJUNGAN ENDPOINTS
 // ============================================================================
-app.get('/api/kunjungan', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/kunjungan', async (_req, res) => {
   try {
     const list = await getAllKunjungan();
     res.json(list.map(mapKunjunganToClient));
@@ -647,7 +739,7 @@ app.get('/api/kunjungan', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/kunjungan', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/kunjungan', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const payload = mapKunjunganFromClient(req.body);
@@ -660,7 +752,7 @@ app.post('/api/kunjungan', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/kunjungan/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const payload = mapKunjunganFromClient({ ...req.body, id: req.params.id });
@@ -676,7 +768,7 @@ app.put('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/kunjungan/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/kunjungan/batch', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const items = Array.isArray(req.body)
@@ -694,7 +786,7 @@ app.post('/api/kunjungan/batch', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/kunjungan/all', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/all', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await clearAllKunjunganFromDb();
@@ -705,7 +797,7 @@ app.delete('/api/kunjungan/all', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.patch('/api/kunjungan/:id/restore', optionalOrRequiredAuth, async (req, res) => {
+app.patch('/api/kunjungan/:id/restore', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await restoreKunjunganById(req.params.id);
@@ -716,7 +808,7 @@ app.patch('/api/kunjungan/:id/restore', optionalOrRequiredAuth, async (req, res)
   }
 });
 
-app.delete('/api/kunjungan/:id/permanent', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/:id/permanent', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await deleteResepByKunjunganId(req.params.id);
@@ -728,7 +820,7 @@ app.delete('/api/kunjungan/:id/permanent', optionalOrRequiredAuth, async (req, r
   }
 });
 
-app.delete('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await deleteResepByKunjunganId(req.params.id);
@@ -752,7 +844,7 @@ app.get('/api/penyakit', async (_req, res) => {
   }
 });
 
-app.post('/api/penyakit', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/penyakit', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertPenyakit(mapPenyakitFromClient(req.body, 0));
@@ -763,7 +855,7 @@ app.post('/api/penyakit', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/penyakit/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/penyakit/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertPenyakit(mapPenyakitFromClient({ ...req.body, id: req.params.id }, 0));
@@ -786,7 +878,7 @@ app.get('/api/referensi', async (_req, res) => {
   }
 });
 
-app.post('/api/referensi', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/referensi', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertReferensi(mapReferensiFromClient(req.body));
@@ -797,7 +889,7 @@ app.post('/api/referensi', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/referensi/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertReferensi(mapReferensiFromClient({ ...req.body, id: req.params.id }));
@@ -808,7 +900,7 @@ app.put('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/referensi/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteReferensiById(req.params.id);
@@ -823,18 +915,20 @@ app.delete('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
 // PENGATURAN, SIDB HISTORY & AUDIT LOG ENDPOINTS
 // ============================================================================
 app.get('/api/pengaturan/:key', async (req, res) => {
+  if (PRIVATE_SETTING_KEYS.test(req.params.key)) return res.status(404).json({ error: 'Tidak ditemukan' });
   try {
     const value = await getSetting(req.params.key);
-    res.json(value);
+    res.json(sanitizeSettings(value));
   } catch (error: any) {
     res.status(500).json({ error: 'Operasi database gagal. Silakan coba kembali.' });
   }
 });
 
-app.post('/api/pengaturan/:key', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/pengaturan/:key', async (req, res) => {
+  if (PRIVATE_SETTING_KEYS.test(req.params.key)) return res.status(404).json({ error: 'Tidak ditemukan' });
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const result = await setSetting(req.params.key, req.body);
+    const result = await setSetting(req.params.key, sanitizeSettings(req.body));
     broadcastSync('pengaturan', clientId);
     res.json(result);
   } catch (error: any) {
@@ -842,7 +936,7 @@ app.post('/api/pengaturan/:key', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/sidb-history', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/sidb-history', async (_req, res) => {
   try {
     const list = await getSidbHistoryList();
     res.json(list.map(mapSidbToClient));
@@ -851,7 +945,7 @@ app.get('/api/sidb-history', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/sidb-history', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/sidb-history', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await addSidbHistoryEntry(mapSidbFromClient(req.body));
@@ -862,7 +956,7 @@ app.post('/api/sidb-history', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/audit', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/audit', async (_req, res) => {
   try {
     const list = await getAuditLogs(500);
     res.json(list.map(mapAuditToClient));
@@ -871,7 +965,7 @@ app.get('/api/audit', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/audit', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/audit', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await addAuditLog(req.body);
@@ -885,7 +979,7 @@ app.post('/api/audit', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // MASTER OBAT & RESEP OBAT ENDPOINTS
 // ============================================================================
-app.get('/api/obat', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/obat', async (_req, res) => {
   try {
     const list = await getAllMasterObat();
     res.json(list.map(mapMasterObatToClient));
@@ -894,7 +988,7 @@ app.get('/api/obat', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/obat', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/obat', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertMasterObat(mapMasterObatFromClient(req.body));
@@ -905,7 +999,7 @@ app.post('/api/obat', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/obat/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/obat/:id', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteMasterObatById(req.params.id);
@@ -916,7 +1010,7 @@ app.delete('/api/obat/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/resep', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/resep', async (_req, res) => {
   try {
     const list = await getAllResepObat();
     res.json(list.map(mapResepObatToClient));
@@ -925,7 +1019,7 @@ app.get('/api/resep', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.put('/api/resep/kunjungan/:kunjunganId', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/resep/kunjungan/:kunjunganId', async (req, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const items = Array.isArray(req.body)
